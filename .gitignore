@@ -1,0 +1,3 @@
+# 開発用サーバーは公開不要（ローカル検証専用）
+_devserver.js
+node_modules/
