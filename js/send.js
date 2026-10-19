@@ -437,6 +437,13 @@ App.Send = (function () {
     fields['完成数量（本）'] = String(answers.honsu);
     fields['パッケージ亡失量（mL）'] = String(answers.pkgLossMl);
     fields['このバッチの充填はこれで最後ですか？（タンクは空になりましたか？）'] = answers.isLast; // はい/いいえ
+    // 「はい」のときだけGASが読む計算入力（schema §A-4）。
+    //   ①工程内亡失(澱廃棄)の行を作る ②パッケージ欠減（残差）から差し引く、の2つに使われる。
+    //   省略すると澱廃棄の行が立たず、その分がパッケージ欠減に乗る＝欠減の内訳が実態と食い違う。
+    //   2026-10-19までアプリ側が送っておらず、Claude経路（brewlog_to_payload.py）だけが送っていた。
+    if (answers.isLast === 'はい') {
+      fields['タンク底の澱(L)'] = String(answers.oriL != null ? answers.oriL : 0);
+    }
     if (answers.fg !== undefined && answers.fg !== '' && answers.fg !== null) {
       fields['最終比重 (FG)'] = String(answers.fg); // ⚠半角空白厳守・文字列で精度保持
     }
@@ -471,6 +478,75 @@ App.Send = (function () {
     return item;
   }
 
+  // ============================================================
+  // P4：出荷（event_type=出荷 / processShukka）schema §A-6
+  //
+  // ⚠ GASは「出荷製品・バッチ」を **1本の文字列** で受け、2段の正規表現で
+  //   製品名／容器／バッチNo に分解する：
+  //     "PON IPA (缶（360ml）) (#26)" → beer_mei='PON IPA' / youki='缶（360ml）' / batch='#26'
+  //   形が崩れると batchNo が '（不明）' のまま着地し、度数も総量(L)も引けない。
+  //   そのため文字列は App.Masters.stockLabel（製品受払簿の実値から組む）で作り、手入力させない。
+  // ⚠ 製品受払簿には「記録者」列が無い（14列）。記録者は台帳に載らず、
+  //   アプリ記帳ログ（受付台帳）側にだけ残る。fields にも入れて経路を揃えておく（GAS側は無視）。
+  // ============================================================
+  function buildShukkaFields(answers) {
+    const fields = {};
+    fields['出荷日'] = toFormDate(answers.shukkabi);
+    fields['出荷製品・バッチ'] = answers.productLabel;
+    fields['出荷数量'] = String(answers.suryo);
+    fields['出荷先'] = answers.shukkasaki;
+    fields['出荷先区分'] = answers.shukkaKubun;
+    if (answers.bikou) fields['摘要'] = answers.bikou; // GASは '備考' も '摘要' も見る（摘要=実フォームの列名）
+    fields['記録者'] = answers.kirokusha;
+    return fields;
+  }
+
+  function buildShukkaSummary(answers) {
+    return '出荷 ' + answers.productLabel + ' ×' + answers.suryo + '（' +
+      answers.shukkasaki + '・' + answers.shukkabi + '）';
+  }
+
+  function enqueueShukka(answers) {
+    if (!answers.productLabel) throw new Error('出荷する製品が選ばれていません。');
+    // GAS側の分解に失敗する形を、送る前にここで止める（'（不明）'バッチでの着地防止）
+    if (!/^.+\s\(.+\)\s\(#\d+\)$/.test(answers.productLabel)) {
+      throw new Error('製品の指定が「製品名 (容器) (#バッチ)」の形になっていません：' + answers.productLabel);
+    }
+    const item = {
+      uuid: uuid(),
+      event_type: '出荷',
+      fields: buildShukkaFields(answers),
+      summary: buildShukkaSummary(answers),
+      createdAt: new Date().toISOString(),
+      status: 'pending',        // pending→sent→verified/held（要件§6-2）
+      firstAttemptAt: null,
+      verifyAttempts: 0,
+      held: false,
+      attempts: 0,
+      lastError: null,
+      lastAttemptAt: null,
+      // 在庫の二重払出を防ぐため、キューに残っている間は在庫から差し引く（出荷画面が参照する）
+      stockKey: answers.productLabel,
+      stockQty: Number(answers.suryo) || 0,
+    };
+    const queue = App.Storage.getQueue();
+    queue.push(item);
+    App.Storage.setQueue(queue);
+    App.Storage.setLastRecorder(answers.kirokusha);
+    App.Storage.setLastShipTo(answers.shukkasaki);
+    return item;
+  }
+
+  // 未送信・反映待ちの出荷でまだ台帳に反映されていない本数（label単位）。
+  // 在庫スナップショットから差し引いて「押せる上限」を決めるのに使う。
+  function reservedShukkaQty(label) {
+    let n = 0;
+    App.Storage.getQueue().forEach(function (it) {
+      if (it.event_type === '出荷' && it.stockKey === label) n += (Number(it.stockQty) || 0);
+    });
+    return n;
+  }
+
   return {
     KUBUN_TO_FIELD,
     toFormDate,
@@ -492,6 +568,11 @@ App.Send = (function () {
     buildSeihinFields,
     buildSeihinSummary,
     enqueueSeihin,
+    // P4
+    buildShukkaFields,
+    buildShukkaSummary,
+    enqueueShukka,
+    reservedShukkaQty,
     queueStats,
     __setVerifyDelaysForTest,
     checkBikoForbidden,

@@ -212,22 +212,170 @@ App.Masters = (function () {
     return names;
   }
 
+  // ── 容器マスターのライブ取得（2026-10-19）──
+  // ⚠ 容器名はGASが容器マスターから「容量(L)」を引くキー。1字違えば容量0＝総量(L)0で着地する。
+  //   そのため製品マスターと同じ「マスターが正・seedは非常用」方式にし、和集合にはしない。
+  const CONTAINER_SHEET_NAME = '容器マスター';
+  const CONTAINER_NAME_KEYS = ['容器名', '容器', 'name'];
+
+  async function refreshContainers(bridgeUrl) {
+    const { header, rows } = await fetchLive(bridgeUrl, CONTAINER_SHEET_NAME);
+    const items = [];
+    for (const row of rows) {
+      const name = pickKey(row, CONTAINER_NAME_KEYS);
+      if (!name) continue;
+      items.push(String(name).trim()); // ⚠ trimのみ。全角括弧・ℓ・大小文字は一切いじらない
+    }
+    if (items.length === 0) throw new Error('容器マスターに容器名が1件もありません');
+    const cache = {
+      fetchedAt: new Date().toISOString(), source: 'live',
+      sheet: CONTAINER_SHEET_NAME, header: header, items: items,
+    };
+    App.Storage.setContainerMasters(cache);
+    return cache;
+  }
+
+  function getActiveContainers() {
+    const cached = App.Storage.getContainerMasters();
+    if (cached && Array.isArray(cached.items) && cached.items.length > 0) return cached;
+    return { fetchedAt: null, source: 'seed', sheet: CONTAINER_SHEET_NAME, header: [],
+             items: App.MastersSeed.containers };
+  }
+
   // ── 容器の候補（P3詰口用）──
-  // ⚠ 現状は同梱seedのみ。容器名はGASが「容量/本」を引くキーなので容器マスターと完全一致が必須。
-  //   製品マスターと同じ型でライブ化できる（refreshProductsを踏襲）→ 未着手・B-083の続き。
+  // ライブ取得できていればマスターの内容だけを返す（seedと和集合にしない＝綴り違いを復活させない）。
   function getContainerCandidates() {
-    return unionSorted(App.MastersSeed.containers, []);
+    const active = getActiveContainers();
+    return (active.items || []).filter(function (s) { return s && String(s).trim() !== ''; });
+  }
+
+  // ── 取引先マスターのライブ取得（P4出荷用・2026-10-19）──
+  // 実列名（2026-10-19 doGetで実測）：取引先ID / 取引先名 / 区分 / 電話番号 / 担当者名 / 備考
+  //   区分は「仕入先」または「出荷先」。出荷先は4件（直販・剣山観光センター・脇町蔵置所・寄贈）。
+  const PARTNER_SHEET_NAME = '取引先マスター';
+
+  async function refreshPartners(bridgeUrl) {
+    const { header, rows } = await fetchLive(bridgeUrl, PARTNER_SHEET_NAME);
+    const shipTo = [], suppliers = [];
+    for (const row of rows) {
+      const name = String(pickKey(row, ['取引先名', '名称', 'name']) || '').trim();
+      if (!name) continue;
+      const kubun = String(row['区分'] || '').trim();
+      if (kubun.indexOf('出荷') !== -1) shipTo.push(name);
+      else if (kubun.indexOf('仕入') !== -1) suppliers.push(name);
+    }
+    if (shipTo.length === 0) throw new Error('取引先マスターに「出荷先」が1件もありません');
+    const cache = {
+      fetchedAt: new Date().toISOString(), source: 'live',
+      sheet: PARTNER_SHEET_NAME, header: header, shipTo: shipTo, suppliers: suppliers,
+    };
+    App.Storage.setPartnerMasters(cache);
+    return cache;
+  }
+
+  function getActivePartners() {
+    const cached = App.Storage.getPartnerMasters();
+    if (cached && Array.isArray(cached.shipTo) && cached.shipTo.length > 0) return cached;
+    return { fetchedAt: null, source: 'seed', sheet: PARTNER_SHEET_NAME,
+             shipTo: App.MastersSeed.shipTo, suppliers: [] };
+  }
+
+  // 出荷先の候補＝取引先マスター（区分=出荷先）。過去入力とは和集合にしない（正はマスター）。
+  function getShipToCandidates() {
+    return (getActivePartners().shipTo || []).slice();
+  }
+
+  // ── 製品在庫スナップショット（P4出荷用・2026-10-19）──
+  // 目的：出荷画面の「出荷製品・バッチ」は**在庫がある組み合わせだけ**を出す。
+  //   processShukka は "製品名 (容器) (#バッチNo)" という1本の文字列を正規表現で分解するため、
+  //   アプリ側が同じ形の文字列を組み立てる。素は製品受払簿そのもの（受入(製造) − 払出(出荷)）。
+  // 検証（2026-10-19）：自前集計の6組 7/72/284/528/1115/926 が、シート自身の
+  //   「バッチ在庫」列の値と完全一致。GAS側の2段正規表現での往復もnodeで全件通過。
+  const SEIHIN_SHEET_NAME = '製品受払簿';
+
+  function stockLabel(product, batch, container) {
+    return product + ' (' + container + ') (' + batch + ')';
+  }
+
+  async function refreshStock(bridgeUrl) {
+    const { rows } = await fetchLive(bridgeUrl, SEIHIN_SHEET_NAME);
+    const order = [];
+    const map = {};
+    const kubunCount = {}; // 取引先 → { 区分: 件数 }（既定値の推定用）
+    for (const row of rows) {
+      const kubunTorihiki = String(row['取引区分'] || '').trim();
+      if (!kubunTorihiki) continue;
+      const product = String(row['製品名'] || '').trim();
+      const batch = String(row['バッチNo'] || '').trim();
+      const container = String(row['容器'] || '').trim();
+      let qty = Number(row['数量（個数）']);
+      if (!isFinite(qty)) qty = 0;
+      if (product && batch) {
+        const key = product + '\u0000' + batch + '\u0000' + container;
+        if (!Object.prototype.hasOwnProperty.call(map, key)) {
+          map[key] = { product: product, batch: batch, container: container, qty: 0 };
+          order.push(key);
+        }
+        // 受入(製造)＝プラス／払出(出荷)＝マイナス
+        map[key].qty += (kubunTorihiki.indexOf('受入') === 0) ? qty : -qty;
+      }
+      if (kubunTorihiki.indexOf('払出') === 0) {
+        const partner = String(row['取引先'] || '').trim();
+        const sk = String(row['出荷先区分'] || '').trim();
+        if (partner && sk) {
+          if (!kubunCount[partner]) kubunCount[partner] = {};
+          kubunCount[partner][sk] = (kubunCount[partner][sk] || 0) + 1;
+        }
+      }
+    }
+    // 取引先ごとに「いちばん多く使われている出荷先区分」を既定値にする（履歴から自動で育つ）
+    const kubunByPartner = {};
+    Object.keys(kubunCount).forEach(function (p) {
+      let best = null, bestN = -1;
+      Object.keys(kubunCount[p]).forEach(function (k) {
+        if (kubunCount[p][k] > bestN) { best = k; bestN = kubunCount[p][k]; }
+      });
+      if (best) kubunByPartner[p] = best;
+    });
+
+    const items = order.map(function (k) { return map[k]; })
+      .filter(function (it) { return it.qty > 0; })
+      .map(function (it) {
+        it.label = stockLabel(it.product, it.batch, it.container);
+        return it;
+      });
+    // ⚠ items が0件でも成功扱いにする（在庫が本当に全部出払っている状態は正常）。
+    const cache = {
+      fetchedAt: new Date().toISOString(), source: 'live',
+      sheet: SEIHIN_SHEET_NAME, items: items, kubunByPartner: kubunByPartner,
+    };
+    App.Storage.setStock(cache);
+    return cache;
+  }
+
+  function getActiveStock() {
+    const cached = App.Storage.getStock();
+    if (cached && Array.isArray(cached.items)) return cached;
+    return { fetchedAt: null, source: 'none', sheet: SEIHIN_SHEET_NAME, items: [], kubunByPartner: {} };
   }
 
   return {
     refresh,
     refreshProducts,
+    refreshContainers,
+    refreshPartners,
+    refreshStock,
     getActive,
     getActiveProducts,
+    getActiveContainers,
+    getActivePartners,
+    getActiveStock,
     getIngredientNames,
     getSupplierCandidates,
     getMakerCandidates,
     getProductCandidates,
     getContainerCandidates,
+    getShipToCandidates,
+    stockLabel,
   };
 })();

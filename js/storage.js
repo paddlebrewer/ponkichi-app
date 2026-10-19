@@ -12,11 +12,15 @@ App.Storage = (function () {
     BRIDGE_URL: 'ponkichi_bridge_url',
     MASTERS: 'ponkichi_masters_cache',   // 原料マスター { fetchedAt, source, sheet, header, items }
     PRODUCT_MASTERS: 'ponkichi_product_masters_cache', // 製品マスター { fetchedAt, source, sheet, header, items }
+    CONTAINER_MASTERS: 'ponkichi_container_masters_cache', // 容器マスター { fetchedAt, source, sheet, header, items }
+    PARTNER_MASTERS: 'ponkichi_partner_masters_cache',     // 取引先マスター { fetchedAt, source, sheet, shipTo, suppliers }
+    STOCK: 'ponkichi_stock_cache',       // 製品在庫スナップショット { fetchedAt, items:[{product,batch,container,qty,label}], kubunByPartner }
     QUEUE: 'ponkichi_queue',             // [{ uuid, event_type, fields, createdAt, attempts, lastError, lastAttemptAt }]
     HISTORY: 'ponkichi_history',         // 直近20件 [{ uuid, event_type, summary, status, sentAt }]
     LAST_RECORDER: 'ponkichi_last_recorder',
     LAST_SUPPLIER: 'ponkichi_last_supplier',
     LAST_MAKER: 'ponkichi_last_maker',
+    LAST_SHIPTO: 'ponkichi_last_shipto', // 前回の出荷先（1タップ確定用）
     SUPPLIER_CANDIDATES: 'ponkichi_supplier_candidates', // 過去に入力した仕入先（自由入力＋候補用）
     MAKER_CANDIDATES: 'ponkichi_maker_candidates',       // 過去に入力したメーカー（自由入力＋候補用）
   };
@@ -82,6 +86,28 @@ App.Storage = (function () {
   function setProductMasters(obj) {
     return setJSON(KEYS.PRODUCT_MASTERS, obj);
   }
+  // 容器マスター：容器名はGASが「容量(L)」を引くキー。綴りが1字違うと総量(L)が0で記帳される
+  // （2026-10-19に同梱seedの容器名5件が実マスターに1件も存在しないことを発見・修正）。
+  function getContainerMasters() {
+    return getJSON(KEYS.CONTAINER_MASTERS, null);
+  }
+  function setContainerMasters(obj) {
+    return setJSON(KEYS.CONTAINER_MASTERS, obj);
+  }
+  // 取引先マスター：区分「出荷先」/「仕入先」で分けて持つ
+  function getPartnerMasters() {
+    return getJSON(KEYS.PARTNER_MASTERS, null);
+  }
+  function setPartnerMasters(obj) {
+    return setJSON(KEYS.PARTNER_MASTERS, obj);
+  }
+  // 製品在庫スナップショット（出荷画面の選択肢の素）
+  function getStock() {
+    return getJSON(KEYS.STOCK, null);
+  }
+  function setStock(obj) {
+    return setJSON(KEYS.STOCK, obj);
+  }
 
   // ── キュー ──
   function getQueue() {
@@ -121,6 +147,12 @@ App.Storage = (function () {
   function setLastMaker(name) {
     if (name) setRaw(KEYS.LAST_MAKER, name);
   }
+  function getLastShipTo() {
+    return getRaw(KEYS.LAST_SHIPTO) || '';
+  }
+  function setLastShipTo(name) {
+    if (name) setRaw(KEYS.LAST_SHIPTO, name);
+  }
 
   // ── 候補リスト（仕入先／メーカー。マスターではなく「過去入力の重複除去リスト」＝候補表示＋自由入力用） ──
   function addCandidate(key, value) {
@@ -150,11 +182,15 @@ App.Storage = (function () {
     getBridgeUrl, setBridgeUrl, clearBridgeUrl,
     getMasters, setMasters,
     getProductMasters, setProductMasters,
+    getContainerMasters, setContainerMasters,
+    getPartnerMasters, setPartnerMasters,
+    getStock, setStock,
     getQueue, setQueue,
     getHistory, pushHistory,
     getLastRecorder, setLastRecorder,
     getLastSupplier, setLastSupplier,
     getLastMaker, setLastMaker,
+    getLastShipTo, setLastShipTo,
     getSupplierCandidates, addSupplierCandidate,
     getMakerCandidates, addMakerCandidate,
   };

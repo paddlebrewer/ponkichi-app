@@ -783,6 +783,29 @@
         },
       },
       {
+        // 🔴 2026-10-19追加：この質問が無く、送信fieldsの「製品化（容器充填）日」が空で飛んでいた。
+        //   空日付は ①詰口簿・製品受払簿の日付が空欄 ②B-092のdecideYoukiBangouが
+        //   「記録日≦BT受入日」側に倒れて亡失3行の容器番号がFV固定、の二重の誤記帳になる。
+        //   本番の「アプリ記帳ログ」が未作成＝アプリからの着地は1件も無く、実害は出ていない。
+        key: 'seihinbi', title: '詰めた日は？', hint: '製品化（容器充填）日として記録します',
+        render: function (body, ctx) {
+          const input = document.createElement('input');
+          input.type = 'date'; input.id = 'input-s-seihinbi'; input.className = 'text-input';
+          input.value = ctx.answers.seihinbi || todayISO();
+          body.appendChild(input);
+        },
+        collect: function () { return $('input-s-seihinbi').value; },
+        validate: async function (v, ctx) {
+          if (!v) return { ok: false, error: '詰めた日を入力してください' };
+          if (v > todayISO()) {
+            const ok = await confirmModal('未来の日付です（' + v + '）。よろしいですか？');
+            if (!ok) return { ok: false, error: null };
+          }
+          ctx.answers.seihinbi = v;
+          return { ok: true };
+        },
+      },
+      {
         key: 'youki', title: '容器は？', hint: 'ひとつの容器につき1回ずつ記録します', auto: true, autoError: '容器を選んでください',
         render: function (body, ctx) {
           const cands = App.Masters.getContainerCandidates();
@@ -868,6 +891,33 @@
         },
       },
       {
+        // 🔴 2026-10-19追加：この質問が無く「タンク底の澱(L)」を送っていなかった。
+        //   processSeihinka は「はい」のときだけこの値を読み、①工程内亡失(澱廃棄)の行を作る
+        //   ②パッケージ欠減（残差）から差し引く、の2つに使う（schema §A-4）。
+        //   送らないと澱廃棄の行が立たず、その分がパッケージ欠減に乗る＝欠減の内訳が実態と違う。
+        key: 'oriL', title: 'タンク底の澱は？（L）', hint: 'トラブ・酵母などの廃棄量。無ければ 0',
+        skipIf: function (a) { return a.isLast !== 'はい'; },
+        render: function (body, ctx) {
+          const input = document.createElement('input');
+          input.type = 'number'; input.inputMode = 'decimal'; input.min = '0';
+          input.id = 'input-s-ori'; input.className = 'text-input text-input--number'; input.placeholder = '例：6';
+          if (ctx.answers.oriL != null) input.value = ctx.answers.oriL;
+          body.appendChild(input);
+          const note = document.createElement('p'); note.className = 'unit-note';
+          note.textContent = '単位：L（リットル）／無ければ 0';
+          body.appendChild(note);
+          setTimeout(function () { input.focus(); }, 50);
+        },
+        collect: function () { return $('input-s-ori').value; },
+        validate: function (v, ctx) {
+          if (v === '' || v == null) return { ok: false, error: '量を入力してください（無ければ 0）' };
+          const n = Number(v);
+          if (!isFinite(n) || n < 0) return { ok: false, error: '0以上の数値を入力してください' };
+          ctx.answers.oriL = n;
+          return { ok: true };
+        },
+      },
+      {
         key: 'bikou', title: '備考があれば（任意）', hint: '無ければ空欄のまま「次へ」。事実だけを書いてください（推測や経緯は書かない）',
         render: function (body, ctx) {
           const input = document.createElement('input');
@@ -920,11 +970,13 @@
       return [
         ['バッチ', a.batchNo],
         ['製品名', a.seihinmei],
+        ['詰めた日', a.seihinbi],
         ['容器', a.youki],
         ['本数', a.honsu + ' 本'],
         ['最終比重(FG)', a.fg || '（未入力）'],
         ['充填で失った量', a.pkgLossMl + ' mL'],
         ['このバッチ最後？', a.isLast],
+        ['タンク底の澱', a.isLast === 'はい' ? (a.oriL + ' L') : '（最後でないため記録しません）'],
         ['備考', a.bikou || '（なし）'],
         ['記録者', a.kirokusha],
       ];
@@ -933,6 +985,271 @@
       return 'ℹ 送信すると製品受払簿・詰口簿へ記帳し、仕込み帳簿のFG・度数・精製量も更新されます。缶と樽の両方があるときは、送信後「続けて記録」でもう一方を入力してください。';
     },
     submit: function (a) { return App.Send.enqueueSeihin(a); },
+  });
+
+  // ============================================================
+  // 出荷ウィザード（§5-5・event_type=出荷 / processShukka）
+  //   新居さん指示（2026-10-19）：出荷は都度入力が理想。Claude経由では時間がかかる。
+  //
+  // 設計の要：processShukka は「出荷製品・バッチ」を **1本の文字列** で受けて
+  //   正規表現で製品名／容器／バッチNoに割る。手入力させると形が崩れてバッチNoが
+  //   '（不明）' で着地するため、選択肢は **製品受払簿の在庫（受入−払出）から機械的に組む**。
+  //   在庫が無い組み合わせは出さない（払出超過＝台帳の在庫がマイナスになる事故の防止）。
+  // ============================================================
+  const STOCK_STALE_MS = 10 * 60 * 1000; // 10分より古いスナップショットは開いた時に裏で取り直す
+  let stockFetching = false;
+
+  // 在庫スナップショットから「いま押せる残り本数」を出す（キューに残っている出荷分を差し引く）
+  function availableQty(item) {
+    return (Number(item.qty) || 0) - App.Send.reservedShukkaQty(item.label);
+  }
+
+  function findStockByLabel(label) {
+    const items = App.Masters.getActiveStock().items || [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].label === label) return items[i];
+    }
+    return null;
+  }
+
+  function renderStockChoices(body, ctx) {
+    body.innerHTML = '';
+    const stock = App.Masters.getActiveStock();
+    const items = (stock.items || []).filter(function (it) { return availableQty(it) > 0; });
+
+    if (items.length === 0) {
+      const warn = document.createElement('div');
+      warn.className = 'block-message';
+      warn.innerHTML = stock.fetchedAt
+        ? '<p>⚠ 出荷できる在庫がある製品が見つかりません。</p>' +
+          '<p>詰口（製品化）の記録がまだなら、先に詰口を記録してください。' +
+          '在庫は製品受払簿の「受入(製造)−払出(出荷)」で判定しています。</p>'
+        : '<p>⚠ 在庫データをまだ取得していません。</p>' +
+          '<p>オンラインのときに「最新の在庫を取得」を押してください。' +
+          '出荷は製品名・容器・バッチの組み合わせが正確でないと記帳できないため、手入力はできません。</p>';
+      body.appendChild(warn);
+    } else {
+      const wrap = document.createElement('div');
+      wrap.className = 'choice-list';
+      items.forEach(function (it) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'choice-btn choice-btn--list';
+        b.innerHTML = escapeHtml(it.label) +
+          '<br><small class="choice-sub">残り ' + availableQty(it) + '</small>';
+        b.addEventListener('click', function () {
+          ctx.answers.productLabel = it.label;
+          ctx.answers.productMax = availableQty(it);
+          ctx.goNext();
+        });
+        wrap.appendChild(b);
+      });
+      body.appendChild(wrap);
+    }
+
+    const note = document.createElement('p');
+    note.className = 'unit-note';
+    note.textContent = stock.fetchedAt
+      ? '在庫データ：' + new Date(stock.fetchedAt).toLocaleString('ja-JP') + ' 時点'
+      : '在庫データ：未取得';
+    body.appendChild(note);
+
+    const btnRefresh = document.createElement('button');
+    btnRefresh.type = 'button'; btnRefresh.className = 'secondary-btn';
+    btnRefresh.textContent = stockFetching ? '取得中…' : '🔄 最新の在庫を取得';
+    btnRefresh.disabled = stockFetching;
+    btnRefresh.addEventListener('click', function () { doRefreshStock(body, ctx, true); });
+    body.appendChild(btnRefresh);
+
+    // 古い／未取得なら、開いた時点で一度だけ裏で取り直す（オフラインなら静かに失敗してキャッシュを使う）
+    const age = stock.fetchedAt ? (Date.now() - new Date(stock.fetchedAt).getTime()) : Infinity;
+    if (!stockFetching && age > STOCK_STALE_MS) doRefreshStock(body, ctx, false);
+  }
+
+  function doRefreshStock(body, ctx, showError) {
+    const url = App.Storage.getBridgeUrl();
+    if (!url) { if (showError) setError('送信先URLが未設定です（設定画面で入力してください）'); return; }
+    stockFetching = true;
+    App.Masters.refreshStock(url).then(function () {
+      stockFetching = false;
+      if (currentScreen === 'wizard') { setError(null); renderStockChoices(body, ctx); }
+    }, function (err) {
+      stockFetching = false;
+      if (currentScreen === 'wizard') {
+        if (showError) setError('在庫を取得できませんでした（' + String(err && err.message || err) + '）');
+        renderStockChoices(body, ctx);
+      }
+    });
+  }
+
+  const Shukka = createWizard({
+    title: '出荷の記録',
+    steps: [
+      {
+        key: 'productLabel', title: '何を出荷しますか？', hint: '在庫のある製品・バッチだけを表示しています',
+        auto: true, autoError: '出荷する製品を選んでください',
+        render: function (body, ctx) { renderStockChoices(body, ctx); },
+      },
+      {
+        key: 'suryo', title: '何本出荷しましたか？', hint: '',
+        render: function (body, ctx) {
+          const it = findStockByLabel(ctx.answers.productLabel);
+          const max = it ? availableQty(it) : (ctx.answers.productMax || 0);
+          wizardHint.textContent = ctx.answers.productLabel + '／残り ' + max;
+          const input = document.createElement('input');
+          input.type = 'number'; input.inputMode = 'numeric'; input.min = '1'; input.step = '1';
+          input.id = 'input-k-suryo'; input.className = 'text-input text-input--number';
+          input.placeholder = '例：12';
+          if (ctx.answers.suryo != null) input.value = ctx.answers.suryo;
+          body.appendChild(input);
+          const unit = document.createElement('p'); unit.className = 'unit-note';
+          unit.textContent = '単位：本（缶・樽の数）／残り ' + max;
+          body.appendChild(unit);
+          const all = document.createElement('button');
+          all.type = 'button'; all.className = 'secondary-btn';
+          all.textContent = '残り全部（' + max + '）';
+          all.addEventListener('click', function () { input.value = String(max); });
+          body.appendChild(all);
+          setTimeout(function () { input.focus(); }, 50);
+        },
+        collect: function () { return $('input-k-suryo').value; },
+        validate: function (v, ctx) {
+          if (v === '' || v == null) return { ok: false, error: '本数を入力してください' };
+          const n = Number(v);
+          if (!Number.isInteger(n) || n <= 0) return { ok: false, error: '1以上の整数を入力してください' };
+          const it = findStockByLabel(ctx.answers.productLabel);
+          const max = it ? availableQty(it) : (ctx.answers.productMax || 0);
+          // ⚠ 在庫超過は確認で通さない。製品受払簿の在庫がマイナスになる＝台帳の誤りになるため。
+          if (n > max) {
+            return { ok: false, error: '在庫（' + max + '）を超えています。本数を確認してください' };
+          }
+          ctx.answers.suryo = n;
+          return { ok: true };
+        },
+      },
+      {
+        key: 'shukkabi', title: '出荷した日は？', hint: '',
+        render: function (body, ctx) {
+          const input = document.createElement('input');
+          input.type = 'date'; input.id = 'input-k-shukkabi'; input.className = 'text-input';
+          input.value = ctx.answers.shukkabi || todayISO();
+          body.appendChild(input);
+        },
+        collect: function () { return $('input-k-shukkabi').value; },
+        validate: async function (v, ctx) {
+          if (!v) return { ok: false, error: '出荷日を入力してください' };
+          if (v > todayISO()) {
+            const ok = await confirmModal('未来の日付です（' + v + '）。よろしいですか？');
+            if (!ok) return { ok: false, error: null };
+          }
+          ctx.answers.shukkabi = v;
+          return { ok: true };
+        },
+      },
+      {
+        key: 'shukkasaki', title: '出荷先は？', hint: '取引先マスターの「出荷先」から選んでください',
+        render: function (body, ctx) {
+          renderSelectWithOther(body, 'shukkasaki', App.Masters.getShipToCandidates(),
+            ctx.answers.shukkasaki || App.Storage.getLastShipTo() || '');
+        },
+        collect: function () { return collectSelectWithOther('shukkasaki'); },
+        validate: function (v, ctx) {
+          if (!v) return { ok: false, error: '出荷先を選ぶか、手入力してください' };
+          if (v !== ctx.answers.shukkasaki) delete ctx.answers.shukkaKubun; // 先が変われば区分も選び直す
+          ctx.answers.shukkasaki = v;
+          return { ok: true };
+        },
+      },
+      {
+        key: 'shukkaKubun', title: '出荷先区分は？', hint: '酒税の課税区分です。必ず確認してください',
+        auto: true, autoError: '出荷先区分を選んでください',
+        render: function (body, ctx) {
+          // 既定値＝その出荷先で過去いちばん多く使われている区分（製品受払簿の実績から自動）。
+          // ⚠ 自動で確定はしない。課税区分なので必ず人が1回押す。
+          const recommended = (App.Masters.getActiveStock().kubunByPartner || {})[ctx.answers.shukkasaki] || '';
+          const opts = App.MastersSeed.shukkaKubun;
+          if (recommended) {
+            wizardHint.textContent = '「' + ctx.answers.shukkasaki + '」は、これまで下の✓の区分で出荷されています';
+          }
+          const wrap = document.createElement('div'); wrap.className = 'choice-list';
+          const ordered = recommended
+            ? [recommended].concat(opts.filter(function (o) { return o !== recommended; }))
+            : opts.slice();
+          ordered.forEach(function (o) {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'choice-btn choice-btn--list' + (o === recommended ? ' choice-btn--recommended' : '');
+            b.textContent = (o === recommended ? '✓ ' : '') + o;
+            b.addEventListener('click', function () { ctx.answers.shukkaKubun = o; ctx.goNext(); });
+            wrap.appendChild(b);
+          });
+          body.appendChild(wrap);
+        },
+      },
+      {
+        key: 'bikou', title: '備考があれば（任意）', hint: '無ければ空欄のまま「次へ」。事実だけを書いてください（推測や経緯は書かない）',
+        render: function (body, ctx) {
+          const input = document.createElement('input');
+          input.type = 'text'; input.id = 'input-k-bikou'; input.className = 'text-input';
+          input.placeholder = '（任意）';
+          if (ctx.answers.bikou) input.value = ctx.answers.bikou;
+          body.appendChild(input);
+        },
+        // B-064・§4-3：推定・届出要否・訂正経緯等は書かない（警告のみ・機械的拒否はしない）
+        validate: async function (v, ctx) {
+          if (v) {
+            const hits = App.Send.checkBikoForbidden(v);
+            if (hits.length > 0) {
+              const ok = await confirmModal(
+                '⚠ この備考には次の内容が含まれているようです：\n「' + hits.join('」「') + '」\n\n' +
+                '推定・届出要否・訂正の経緯などは備考欄に書かず、事実だけを記録してください。\n' +
+                'このまま進めますか？'
+              );
+              if (!ok) return { ok: false, error: null };
+            }
+          }
+          ctx.answers.bikou = v;
+          return { ok: true };
+        },
+        collect: function () { return $('input-k-bikou').value.trim(); },
+      },
+      {
+        key: 'kirokusha', title: '記録者は？', hint: '',
+        render: function (body, ctx) {
+          const last = App.Storage.getLastRecorder();
+          if (last) {
+            const quick = document.createElement('button');
+            quick.type = 'button'; quick.className = 'choice-btn'; quick.textContent = '前回と同じ：' + last;
+            quick.addEventListener('click', function () { ctx.answers.kirokusha = last; ctx.goNext(); });
+            body.appendChild(quick);
+          }
+          const input = document.createElement('input');
+          input.type = 'text'; input.id = 'input-k-kirokusha'; input.className = 'text-input';
+          input.value = ctx.answers.kirokusha || last || '';
+          body.appendChild(input);
+        },
+        collect: function () { return $('input-k-kirokusha').value.trim(); },
+        validate: function (v, ctx) {
+          if (!v) return { ok: false, error: '記録者を入力してください' };
+          ctx.answers.kirokusha = v; return { ok: true };
+        },
+      },
+    ],
+    confirmRows: function (a) {
+      return [
+        ['製品・バッチ', a.productLabel],
+        ['数量', a.suryo + ' 本'],
+        ['出荷日', a.shukkabi],
+        ['出荷先', a.shukkasaki],
+        ['出荷先区分', a.shukkaKubun],
+        ['備考', a.bikou || '（なし）'],
+        ['記録者', a.kirokusha],
+      ];
+    },
+    confirmNote: function () {
+      return 'ℹ 度数と総量(L)はPonkichiが自動計算します（容器マスターの容量×本数・仕込み帳簿の度数）。' +
+        '出荷先区分は酒税の課税区分です。間違えると申告額が変わるので、送信前に見直してください。';
+    },
+    submit: function (a) { return App.Send.enqueueShukka(a); },
   });
 
   // ── 確認画面（共通・activeWizardを参照） ──
@@ -1029,6 +1346,7 @@
   document.querySelector('[data-action="start-hakko"]').addEventListener('click', function () { Hakko.start(); });
   document.querySelector('[data-action="start-bt"]').addEventListener('click', function () { BT.start(); });
   document.querySelector('[data-action="start-seihin"]').addEventListener('click', function () { Seihin.start(); });
+  document.querySelector('[data-action="start-shukka"]').addEventListener('click', function () { Shukka.start(); });
   $('btn-goto-history').addEventListener('click', function () { showScreen('history'); renderHistory(); });
   $('btn-goto-settings').addEventListener('click', function () { showScreen('settings'); renderSettings(); });
 
@@ -1045,9 +1363,16 @@
       const fetchedAt = active.fetchedAt ? new Date(active.fetchedAt).toLocaleString('ja-JP') : '（未取得）';
       return label + '：' + src + '／' + (active.items || []).length + '件／取得日時：' + fetchedAt;
     }
+    const partners = App.Masters.getActivePartners();
+    const stock = App.Masters.getActiveStock();
     $('masters-status').textContent =
       line('原料マスター', App.Masters.getActive()) + '\n' +
-      line('製品マスター', App.Masters.getActiveProducts());
+      line('製品マスター', App.Masters.getActiveProducts()) + '\n' +
+      line('容器マスター', App.Masters.getActiveContainers()) + '\n' +
+      line('出荷先（取引先マスター）', { source: partners.source, items: partners.shipTo, fetchedAt: partners.fetchedAt }) + '\n' +
+      '製品在庫：' + (stock.fetchedAt
+        ? (stock.items || []).length + '件／取得日時：' + new Date(stock.fetchedAt).toLocaleString('ja-JP')
+        : '未取得');
   }
 
   $('btn-save-url').addEventListener('click', function () {
@@ -1067,11 +1392,17 @@
         function (e) { return '原料（' + String(e && e.message || e) + '）'; }),
       App.Masters.refreshProducts(url).then(function () { return null; },
         function (e) { return '製品（' + String(e && e.message || e) + '）'; }),
+      App.Masters.refreshContainers(url).then(function () { return null; },
+        function (e) { return '容器（' + String(e && e.message || e) + '）'; }),
+      App.Masters.refreshPartners(url).then(function () { return null; },
+        function (e) { return '取引先（' + String(e && e.message || e) + '）'; }),
+      App.Masters.refreshStock(url).then(function () { return null; },
+        function (e) { return '製品在庫（' + String(e && e.message || e) + '）'; }),
     ]);
     const failed = results.filter(Boolean);
     $('masters-refresh-msg').textContent = failed.length === 0
-      ? '取得に成功しました（原料・製品とも）。'
-      : '取得に失敗：' + failed.join(' / ') + '。失敗した方は同梱データのまま使用します。';
+      ? '取得に成功しました（原料・製品・容器・取引先・製品在庫）。'
+      : '取得に失敗：' + failed.join(' / ') + '。失敗した方は同梱データ／前回取得分のまま使用します。';
     renderMastersStatus();
   });
 
@@ -1170,6 +1501,16 @@
       });
       App.Masters.refreshProducts(url).catch(function (err) {
         console.warn('[app] 製品マスター背景取得に失敗（同梱データのまま使用）', err);
+      });
+      App.Masters.refreshContainers(url).catch(function (err) {
+        console.warn('[app] 容器マスター背景取得に失敗（同梱データのまま使用）', err);
+      });
+      App.Masters.refreshPartners(url).catch(function (err) {
+        console.warn('[app] 取引先マスター背景取得に失敗（同梱データのまま使用）', err);
+      });
+      // 製品在庫は出荷画面を開いたときにも取り直す（起動時の値は古くなるため）
+      App.Masters.refreshStock(url).catch(function (err) {
+        console.warn('[app] 製品在庫の背景取得に失敗（前回取得分のまま使用）', err);
       });
     }
   }
