@@ -203,6 +203,10 @@ App.Send = (function () {
       summary: item.summary,
       status: 'verified',
       sentAt: new Date().toISOString(),
+      // 出荷のみ：在庫スナップショットより後に着地した分を差し引くために持ち越す。
+      // キューから消えた時点で差し引きが効かなくなると、同じ在庫を二度出荷できてしまう。
+      stockKey: item.stockKey || null,
+      stockQty: item.stockQty || 0,
     });
   }
 
@@ -537,13 +541,25 @@ App.Send = (function () {
     return item;
   }
 
-  // 未送信・反映待ちの出荷でまだ台帳に反映されていない本数（label単位）。
-  // 在庫スナップショットから差し引いて「押せる上限」を決めるのに使う。
+  // 在庫スナップショットに「まだ反映されていない」出荷の本数（label単位）。
+  //   ①キューに残っている分（未送信・反映待ち・要確認）
+  //   ②スナップショットを取った後に着地が確認できた分（履歴）
+  // ②を数えないと、着地確認でキューから消えた直後に同じ在庫をもう一度出荷できてしまう
+  //   （製品受払簿の在庫がマイナス＝台帳の誤りになる）。
   function reservedShukkaQty(label) {
     let n = 0;
     App.Storage.getQueue().forEach(function (it) {
       if (it.event_type === '出荷' && it.stockKey === label) n += (Number(it.stockQty) || 0);
     });
+    const stock = App.Storage.getStock();
+    const snapAt = stock && stock.fetchedAt ? new Date(stock.fetchedAt).getTime() : null;
+    if (snapAt !== null) {
+      App.Storage.getHistory().forEach(function (h) {
+        if (h.event_type !== '出荷' || h.stockKey !== label) return;
+        const t = h.sentAt ? new Date(h.sentAt).getTime() : 0;
+        if (t > snapAt) n += (Number(h.stockQty) || 0);
+      });
+    }
     return n;
   }
 

@@ -1069,12 +1069,19 @@
     const url = App.Storage.getBridgeUrl();
     if (!url) { if (showError) setError('送信先URLが未設定です（設定画面で入力してください）'); return; }
     stockFetching = true;
+    // ⚠ 取得は数秒かかる。その間にスタッフは先へ進んでいる可能性がある。
+    //   wizard-body は全ステップで使い回す1枚なので、無条件に描き直すと
+    //   「何本出荷しましたか？」の上に製品一覧を上書きし、入力欄が消えて操作不能になる。
+    //   → まだ製品選択の画面にいるときだけ描き直す。
+    function stillOnProductStep() {
+      return currentScreen === 'wizard' && activeWizard === Shukka && ctx.stepIndex === 0;
+    }
     App.Masters.refreshStock(url).then(function () {
       stockFetching = false;
-      if (currentScreen === 'wizard') { setError(null); renderStockChoices(body, ctx); }
+      if (stillOnProductStep()) { setError(null); renderStockChoices(body, ctx); }
     }, function (err) {
       stockFetching = false;
-      if (currentScreen === 'wizard') {
+      if (stillOnProductStep()) {
         if (showError) setError('在庫を取得できませんでした（' + String(err && err.message || err) + '）');
         renderStockChoices(body, ctx);
       }
